@@ -1,11 +1,11 @@
-﻿<# 
+<# 
     .DESCRIPTION 
-        This will update the failed over VNET Custom DNS to point to the failed over ADDC Private IP. 
+        This will create a CSE to execute PS script to disable AAD Sync, user must understand failover DR needs, and if needed manually run AD Sync or ##: Set-ADSyncScheduler -SyncCycleEnabled $true. 
          
  
     .NOTES 
         AUTHOR: naswif@microsoft.com 
-        LASTEDIT: 8 Novemeber, 2018 
+        LASTEDIT: 26 October, 2018 
 #> 
 param ( 
         [Object]$RecoveryPlanContext 
@@ -13,10 +13,31 @@ param (
 
 Write-Output $RecoveryPlanContext
 
-# RecoveryVM Context and VMs
-$VMinfo = $RecoveryPlanContext.VmMap | Get-Member | Where-Object MemberType -EQ NoteProperty | select -ExpandProperty Name
-$vmMap = $RecoveryPlanContext.VmMap
+if($RecoveryPlanContext.FailoverDirection -ne 'PrimaryToSecondary')
+{
+    Write-Output 'Script is ignored since Azure is not the target'
+}
+else
+{
 
+    $VMinfo = $RecoveryPlanContext.VmMap | Get-Member | Where-Object MemberType -EQ NoteProperty | select -ExpandProperty Name
+
+    Write-Output ("Found the following VMGuid(s): `n" + $VMInfo)
+
+    if ($VMInfo -is [system.array])
+    {
+        $VMinfo = $VMinfo[0]
+
+        Write-Output "Found multiple VMs in the Recovery Plan"
+    }
+    else
+    {
+        Write-Output "Found only a single VM in the Recovery Plan"
+    }
+
+    $RGName = $RecoveryPlanContext.VmMap.$VMInfo.ResourceGroupName
+
+    Write-OutPut ("Name of resource group: " + $RGName)
 Try
  {
     "Logging in to Azure..."
@@ -35,36 +56,41 @@ Catch
       Write-Error -Message $ErrorMessage `
                     -ErrorAction Stop
  }
-    # Set Custom DNS on failovered VNET
-
+    # Set FTP VM within the Resource Group
+Try
+ {
+    $VMs = Get-AzureRmVm -ResourceGroupName $RGName
+    Write-Output ("Found the following VMs: `n " + $VMs.Name) 
+ }
+Catch
+ {
+      $ErrorMessage = 'Failed to find any VMs in the Resource Group.'
+      $ErrorMessage += " `n"
+      $ErrorMessage += 'Error: '
+      $ErrorMessage += $_
+      Write-Error -Message $ErrorMessage `
+                    -ErrorAction Stop
+ }
  Try
  {
-     foreach ($VMID in $VMinfo)
+     foreach ($VM in $VMs)
     {
-        $vmprop = $vmMap.$VMID
-        $VM = Get-AzureRmVM -ResourceGroupName $vmprop.ResourceGroupName -Name $vmprop.RoleName
-
-        If ($VM.Name -match "ADDC" ) 
+        If ($VM.Name -match "AADCONNECT" ) 
         {
+            Write-Output ("AADCONNECT VM Found")
+            $url = "https://raw.githubusercontent.com/swiftsolves-msft/ASR-HUB-SPOKE-FTP/master/scripts/aadsyncdisable.ps1"
+            $guid = New-Guid
 
-                #Capture ARM NIC
-                $ARMNic = Get-AzureRmResource -ResourceId $VM.NetworkProfile.NetworkInterfaces[0].id
-                $NIC = Get-AzureRmNetworkInterface -Name $ARMNic.Name -ResourceGroupName $ARMNic.ResourceGroupName
-
-                $subnetid = $NIC.IpConfigurations.Subnet.Id
-                $vnetrg = $subnetid.Split("/")[4]
-                $vnetname = $subnetid.Split("/")[8]
-
-                $vnet = Get-AzureRmVirtualNetwork -ResourceGroupName $vnetrg -Name $vnetname
-                $vnet.DhcpOptions.DnsServers = $NIC.IpConfigurations.PrivateIpAddress
-                $vnet.DhcpOptions.DnsServers += "8.8.8.8"
-                Set-AzureRmVirtualNetwork -VirtualNetwork $vnet
-
-
+            Set-AzureRmVMCustomScriptExtension -ResourceGroupName $RGName `
+            -VMName $VM.Name `
+            -Location $VM.Location `
+            -FileUri $url `
+            -Run 'aadsyncdisable.ps1' `
+            -Name "AADSyncDisable-$guid"
         }
         Else 
         {
-            Write-Output ("ADDC VM NOT Found!")
+            Write-Output ("FTP AADCONNECT NOT Found!")
         }
     }
  }
@@ -77,29 +103,4 @@ Catch
       Write-Error -Message $ErrorMessage `
                     -ErrorAction Stop
  }
-
-
-$failType = $RecoveryPlanContext.FailoverType
-Write-Output ("$FailType FAILOVER")
-$faildirection = $RecoveryPlanContext.FailoverDirection
-Write-Output ("Direction: $faildirection")
-
- If ($RecoveryPlanContext.FailoverType -match "planned" -or $RecoveryPlanContext.FailoverType -match "unplanned" -and $RecoveryPlanContext.FailoverDirection -eq "PrimaryToSecondary") {
-
-    $vnet = Get-AzureRmVirtualNetwork -ResourceGroupName "rgSwiftNetworking" -Name "SWIFT-VNET-WUS-SPOKE-1"
-    $vnet.DhcpOptions.DnsServers = $NIC.IpConfigurations.PrivateIpAddress
-    $vnet.DhcpOptions.DnsServers += "8.8.8.8"
-    Set-AzureRmVirtualNetwork -VirtualNetwork $vnet
-
- }
- Elseif ($RecoveryPlanContext.FailoverType -match "planned" -or $RecoveryPlanContext.FailoverType -match "unplanned" -and $RecoveryPlanContext.FailoverDirection -eq "SecondaryToPrimary"){
- 
-    $vnet = Get-AzureRmVirtualNetwork -ResourceGroupName "rgSwiftNetworking" -Name "SWIFT-VNET-EUS-SPOKE-1"
-    $vnet.DhcpOptions.DnsServers = $NIC.IpConfigurations.PrivateIpAddress
-    $vnet.DhcpOptions.DnsServers += "8.8.8.8"
-    Set-AzureRmVirtualNetwork -VirtualNetwork $vnet
-
- }
- Else {
-    Write-Output ("TEST FAILOVER")
- }
+}
